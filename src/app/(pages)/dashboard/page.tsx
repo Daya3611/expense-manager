@@ -5,8 +5,8 @@ import { addExpense, deleteExpense, getExpenses } from "@/app/firebase/firestore
 import { logoutUser } from "@/app/firebase/auth";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
-// Removed chart dependency
 
+// Interfaces
 interface Transaction {
   id: string;
   amount: number;
@@ -17,6 +17,12 @@ interface Transaction {
   time?: string;
   createdAt: string;
 }
+
+// Categories setup
+const categories = {
+  debit: ['Food & Dining', 'Transportation', 'Shopping', 'Entertainment', 'Bills & Utilities', 'Healthcare', 'Education', 'Others'],
+  credit: ['Salary', 'Freelance', 'Investment', 'Gift', 'Refund', 'Business', 'Others']
+};
 
 export default function BankingDashboard() {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
@@ -30,26 +36,45 @@ export default function BankingDashboard() {
   const [filter, setFilter] = useState<'all' | 'credit' | 'debit'>('all');
   const router = useRouter();
 
-  const categories = {
-    debit: ['Food & Dining', 'Transportation', 'Shopping', 'Entertainment', 'Bills & Utilities', 'Healthcare', 'Education', 'Others'],
-    credit: ['Salary', 'Freelance', 'Investment', 'Gift', 'Refund', 'Business', 'Others']
-  };
+  // Chart color palette
+  const chartColors = [
+    "#3B82F6", "#EF4444", "#10B981", "#F59E0B", "#8B5CF6",
+    "#EC4899", "#6B7280", "#14B8A6"
+  ];
 
+  // -- FETCH & PARSE TRANSACTIONS --
   const fetch = async () => {
     setIsLoading(true);
-    const data = await getExpenses();
-    setTransactions(data);
+    const expenses = await getExpenses();
+
+    // Defensive parse for *all* incoming expenses
+    const transactions: Transaction[] = expenses.map((txn: any) => {
+      const parts = (txn.description || '').split('|');
+      let type = parts[0];
+      if (type !== 'credit' && type !== 'debit') type = 'debit'; // fallback if corrupt
+
+      return {
+        ...txn,
+        type: type as 'credit' | 'debit',
+        category: parts[1] || 'Others',
+        description: parts[2] || '',
+        date: parts[3] || (txn.createdAt ? new Date(txn.createdAt).toISOString().split('T')[0] : ''),
+        time: parts[4] || (txn.createdAt ? new Date(txn.createdAt).toTimeString().slice(0, 5) : ''),
+      };
+    });
+
+    setTransactions(transactions);
     setIsLoading(false);
   };
 
+  // -- ADD TRANSACTION --
   const add = async () => {
     if (!amount || !description || !category) return;
     setIsLoading(true);
-    
-    // Use provided time or current time if empty
+
     const transactionTime = time || new Date().toTimeString().slice(0, 5);
     const transactionDateTime = new Date(`${date}T${transactionTime}`).toISOString();
-    
+
     const transactionData = {
       amount: parseFloat(amount),
       description,
@@ -59,9 +84,12 @@ export default function BankingDashboard() {
       time: transactionTime,
       createdAt: transactionDateTime
     };
-    
-    await addExpense(transactionData.amount, `${transactionData.type}|${transactionData.category}|${transactionData.description}|${transactionData.date}|${transactionData.time}`);
-    
+
+    await addExpense(
+      transactionData.amount,
+      `${transactionData.type}|${transactionData.category}|${transactionData.description}|${transactionData.date}|${transactionData.time}`
+    );
+
     setAmount("");
     setDescription("");
     setCategory("");
@@ -70,17 +98,20 @@ export default function BankingDashboard() {
     fetch();
   };
 
+  // -- DELETE TRANSACTION --
   const remove = async (id: string) => {
     setIsLoading(true);
     await deleteExpense(id);
     fetch();
   };
 
+  // -- LOGOUT --
   const logout = async () => {
     await logoutUser();
     router.push("/login");
   };
 
+  // -- EXPORT TO PDF --
   const exportToPDF = () => {
     const doc = new jsPDF();
     doc.setFontSize(18);
@@ -100,74 +131,49 @@ export default function BankingDashboard() {
       ]),
     });
 
-    const date = new Date().toISOString().slice(0, 10);
-    doc.save(`bank-statement-${date}.pdf`);
+    const dateStr = new Date().toISOString().slice(0, 10);
+    doc.save(`bank-statement-${dateStr}.pdf`);
   };
 
-  // Process transactions to include type and category
-  const processedTransactions = transactions.map(txn => {
-    const parts = txn.description.split('|');
-    if (parts.length >= 5) {
-      return {
-        ...txn,
-        type: parts[0] as 'credit' | 'debit',
-        category: parts[1],
-        description: parts[2],
-        date: parts[3],
-        time: parts[4]
-      };
-    }
-    // Handle legacy format or incomplete data
-    const currentDate = new Date(txn.createdAt);
-    return {
-      ...txn,
-      type: 'debit' as const,
-      category: 'Others',
-      date: currentDate.toISOString().split('T')[0],
-      time: currentDate.toTimeString().slice(0, 5)
-    };
-  });
+  // -- FILTER & SORT TRANSACTIONS --
+  const filteredTransactions = transactions
+    .filter(txn => filter === 'all' || txn.type === filter)
+    .sort((a, b) => {
+      // Sort by date+time ascending (oldest first)
+      const tsA = new Date(`${a.date}T${a.time || '00:00'}`).getTime();
+      const tsB = new Date(`${b.date}T${b.time || '00:00'}`).getTime();
+      return tsA - tsB;
+    });
 
-  const filteredTransactions = processedTransactions.filter(txn => 
-    filter === 'all' || txn.type === filter
-  ).sort((a, b) => {
-    // Sort by date and time (oldest first)
-    const dateTimeA = new Date(`${a.date}T${a.time || '00:00'}`).getTime();
-    const dateTimeB = new Date(`${b.date}T${b.time || '00:00'}`).getTime();
-    return dateTimeA - dateTimeB;
-  });
-
+  // -- BALANCE AND SUMMARY --
   const calculateBalance = () => {
-    return processedTransactions.reduce((balance, txn) => {
-      return txn.type === 'credit' ? balance + txn.amount : balance - txn.amount;
-    }, 0);
+    return transactions.reduce((balance, txn) =>
+      txn.type === 'credit' ? balance + txn.amount : balance - txn.amount
+    , 0);
   };
-
   const calculateRunningBalance = (txns: Transaction[]) => {
-    const balance = txns.reduce((bal, txn) => {
-      return txn.type === 'credit' ? bal + txn.amount : bal - txn.amount;
-    }, 0);
+    const balance = txns.reduce((bal, txn) =>
+      txn.type === 'credit' ? bal + txn.amount : bal - txn.amount
+    , 0);
     return `₹${balance.toLocaleString()}`;
   };
-
-  const totalCredits = processedTransactions.filter(t => t.type === 'credit').reduce((sum, t) => sum + t.amount, 0);
-  const totalDebits = processedTransactions.filter(t => t.type === 'debit').reduce((sum, t) => sum + t.amount, 0);
+  const totalCredits = transactions.filter(t => t.type === 'credit').reduce((sum, t) => sum + t.amount, 0);
+  const totalDebits = transactions.filter(t => t.type === 'debit').reduce((sum, t) => sum + t.amount, 0);
   const currentBalance = calculateBalance();
 
-  const categorySummary = processedTransactions.reduce((acc: any, txn) => {
+  // -- ANALYTICS --
+  const categorySummary = transactions.reduce((acc: any, txn) => {
     const key = `${txn.type}_${txn.category}`;
     acc[key] = (acc[key] || 0) + txn.amount;
     return acc;
   }, {});
-
-  const chartColors = ["#3B82F6", "#EF4444", "#10B981", "#F59E0B", "#8B5CF6", "#EC4899", "#6B7280", "#14B8A6"];
   const categoryEntries = Object.entries(categorySummary);
   const totalAmount = categoryEntries.reduce((sum, [, amount]) => sum + (amount as number), 0);
 
-  useEffect(() => {
-    fetch();
-  }, []);
+  // -- INITIALIZE --
+  useEffect(() => { fetch(); }, []);
 
+  // -- RENDER --
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50 to-indigo-100 py-6 px-4 font-sans">
       <div className="container mx-auto max-w-6xl">
@@ -175,7 +181,7 @@ export default function BankingDashboard() {
         {/* Header */}
         <div className="flex justify-between items-center mb-8">
           <div>
-            <h1 className="text-3xl font-bold text-slate-800">Banking Dashboard</h1>
+            <h1 className="text-3xl font-bold text-slate-800">Expence Tracker</h1>
             <p className="text-slate-600 mt-1">Manage your finances with ease</p>
           </div>
           <button onClick={logout} className="bg-red-500 hover:bg-red-600 text-white px-6 py-3 rounded-xl font-semibold shadow-lg transition">
@@ -222,7 +228,6 @@ export default function BankingDashboard() {
             <span className="mr-3">➕</span>
             Add New Transaction
           </h2>
-          
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             <div>
               <label className="block text-slate-700 font-medium mb-2">Transaction Type</label>
@@ -249,7 +254,6 @@ export default function BankingDashboard() {
                 </button>
               </div>
             </div>
-            
             <div>
               <label className="block text-slate-700 font-medium mb-2">Date</label>
               <input
@@ -259,7 +263,6 @@ export default function BankingDashboard() {
                 className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent"
               />
             </div>
-            
             <div>
               <label className="block text-slate-700 font-medium mb-2">Time</label>
               <input
@@ -271,7 +274,6 @@ export default function BankingDashboard() {
               />
               <p className="text-xs text-gray-500 mt-1">Leave empty to use current time</p>
             </div>
-            
             <div>
               <label className="block text-slate-700 font-medium mb-2">Amount (₹)</label>
               <input
@@ -282,7 +284,6 @@ export default function BankingDashboard() {
                 className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent"
               />
             </div>
-            
             <div>
               <label className="block text-slate-700 font-medium mb-2">Category</label>
               <select
@@ -296,7 +297,6 @@ export default function BankingDashboard() {
                 ))}
               </select>
             </div>
-            
             <div className="md:col-span-2">
               <label className="block text-slate-700 font-medium mb-2">Description</label>
               <input
@@ -308,7 +308,6 @@ export default function BankingDashboard() {
               />
             </div>
           </div>
-          
           <div className="flex gap-4 mt-6">
             <button
               onClick={add}
@@ -327,7 +326,7 @@ export default function BankingDashboard() {
         </div>
 
         {/* Analytics Chart */}
-        {processedTransactions.length > 0 && (
+        {transactions.length > 0 && (
           <div className="bg-white rounded-2xl shadow-xl p-8 mb-8">
             <h2 className="text-2xl font-semibold text-slate-800 mb-6 flex items-center">
               <span className="mr-3">📊</span>
@@ -340,10 +339,11 @@ export default function BankingDashboard() {
                   <svg className="w-full h-full transform -rotate-90" viewBox="0 0 100 100">
                     {categoryEntries.map(([key, amount], i) => {
                       const percentage = (amount as number) / totalAmount;
-                      const circumference = 2 * Math.PI * 30; // radius = 30
-                      const strokeDasharray = circumference * percentage;
-                      const strokeDashoffset = -circumference * categoryEntries.slice(0, i).reduce((sum, [, amt]) => sum + (amt as number), 0) / totalAmount;
-                      
+                      const circumference = 2 * Math.PI * 30;
+                      const offset = circumference * categoryEntries
+                        .slice(0, i)
+                        .reduce((sum, [, amt]) => sum + (amt as number), 0) / totalAmount;
+                      const strokeDasharray = `${circumference * percentage} ${circumference}`;
                       return (
                         <circle
                           key={key}
@@ -353,9 +353,8 @@ export default function BankingDashboard() {
                           fill="transparent"
                           stroke={chartColors[i % chartColors.length]}
                           strokeWidth="8"
-                          strokeDasharray={`${strokeDasharray} ${circumference}`}
-                          strokeDashoffset={strokeDashoffset}
-                          className="transition-all duration-300 hover:stroke-width-10"
+                          strokeDasharray={strokeDasharray}
+                          strokeDashoffset={-offset}
                         />
                       );
                     })}
@@ -407,7 +406,7 @@ export default function BankingDashboard() {
               <span className="mr-3">📋</span>
               Transaction History
             </h2>
-            <div className="flex gap-2">
+            <div className="flex-col md:flex-col gap-2">
               <button
                 onClick={() => setFilter('all')}
                 className={`px-4 py-2 rounded-lg font-medium transition ${
@@ -448,7 +447,7 @@ export default function BankingDashboard() {
             </div>
           ) : (
             <div className="space-y-3">
-              {filteredTransactions.map((txn, index) => (
+              {filteredTransactions.map((txn) => (
                 <div key={txn.id} className="flex items-center justify-between p-4 bg-gray-50 rounded-xl hover:bg-gray-100 transition">
                   <div className="flex items-center space-x-4">
                     <div className={`w-12 h-12 rounded-full flex items-center justify-center ${
